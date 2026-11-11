@@ -1,0 +1,12 @@
+# S参数串扰计算工具 —— 运行与基本冒烟依赖
+# 安装: python -m pip install -r requirements.txt
+# Python 3.12+；当前验证环境: Windows / Python 3.14.5
+# tkinter 由 Python 安装程序提供，需启用 Tcl/Tk 支持。
+
+numpy==2.5.2        # 数值计算
+scipy==1.18.1       # PCHIP 插值
+matplotlib==3.11.1  # TkAgg 曲线绘制
+ttkbootstrap==2.2.2 # Tk 界面主题组件
+
+# 仅打包 exe 时另行安装:
+# python -m pip install pyinstaller==6.22.2

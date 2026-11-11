@@ -1,0 +1,19 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.spec text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.s[0-9]*p text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary

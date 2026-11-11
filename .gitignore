@@ -1,0 +1,34 @@
+# Python 与本地环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+.pypirc
+
+# 构建产物
+/build/
+/dist/
+*.egg-info/
+
+# 编辑器与检查缓存
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.log
+
+# 本地配置、备份与测试临时数据
+/branding.private.json
+spara_ui_default.json
+*.[sS][0-9]*[pP].json
+/backup/
+/fixtures/
+/tests/requested_changes_*/
+/tests/ui_revisions_*/
+/tests/tmp*/
