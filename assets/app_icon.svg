@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>S-parameter crosstalk and noise</title>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#FFFFFF"/>
+  <path d="M 56 128 L 200 128" fill="none" stroke="#C4D2DB" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 40 88 L 66 88 L 83 55 L 111 117 L 139 55 L 167 88 L 216 88" fill="none" stroke="#009BB5" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 40 174 L 76 174 L 91 160 L 105 188 L 121 151 L 137 190 L 152 163 L 168 174 L 216 174" fill="none" stroke="#E88719" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 128 112 L 128 135" fill="none" stroke="#456477" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 120 128 L 128 136 L 136 128" fill="none" stroke="#456477" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="40" cy="88" r="12" fill="#009BB5"/>
+  <circle cx="40" cy="88" r="4" fill="#FFFFFF"/>
+  <circle cx="216" cy="88" r="12" fill="#009BB5"/>
+  <circle cx="216" cy="88" r="4" fill="#FFFFFF"/>
+  <circle cx="40" cy="174" r="12" fill="#E88719"/>
+  <circle cx="40" cy="174" r="4" fill="#FFFFFF"/>
+  <circle cx="216" cy="174" r="12" fill="#E88719"/>
+  <circle cx="216" cy="174" r="4" fill="#FFFFFF"/>
+</svg>

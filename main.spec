@@ -7,11 +7,14 @@
 import json
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 # PyInstaller 6.22 无 hook-ttkbootstrap, 主题图标字体 (bootstrap.ttf)
 # 不会自动收集, 必须显式声明, 否则启动即 FileNotFoundError
 datas = collect_data_files('ttkbootstrap')
+icon_path = Path(SPECPATH) / 'assets' / 'app_icon.ico'
+datas += [(str(icon_path), 'assets'),
+          (str(Path(SPECPATH) / 'assets' / 'app_icon.png'), 'assets')]
 branding_path = Path(SPECPATH) / 'branding.private.json'
 if branding_path.exists():
     try:
@@ -26,9 +29,9 @@ if branding_path.exists():
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=datas,
-    hiddenimports=[],
+    binaries=collect_dynamic_libs('pyopencl'),
+    datas=datas + collect_data_files('pyopencl'),
+    hiddenimports=['pyopencl', 'pyopencl._cl', 'threadpoolctl'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -42,7 +45,7 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-# plot_runtime isolates configuration while retaining a persistent font cache.
+# plot_runtime keeps configuration read-only and font indexing in memory.
 a.scripts = [script for script in a.scripts if script[0] != 'pyi_rth_mplconfig']
 pyz = PYZ(a.pure)
 
@@ -54,6 +57,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='S参数串扰计算',
+    icon=str(icon_path),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

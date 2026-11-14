@@ -1,6 +1,7 @@
 """基本 GUI 冒烟：python -B tests/_smoke_gui.py（需要桌面会话）。"""
 
 import csv
+import os
 import shutil
 import sys
 import tempfile
@@ -20,6 +21,24 @@ from app import APP_VERSION, SParamPowerSumApp
 def run_smoke(directory):
     sample = directory / 'demo.s8p'
     shutil.copyfile(PROJECT / 'sample_data' / sample.name, sample)
+    writes = []
+    allowed = {str(directory / 'results.csv'), str(sample) + '.json'}
+    auditing = True
+
+    def audit(event, args):
+        if not auditing:
+            return
+        if event == 'open':
+            path, mode, flags = args
+            if (mode and any(c in mode for c in 'wax+')) or flags & (
+                    os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+                if str(path) not in allowed:
+                    writes.append((event, str(args)))
+        elif event in ('os.mkdir', 'os.remove', 'os.rename', 'os.rmdir',
+                       'tempfile.mkstemp', 'tempfile.mkdtemp'):
+            writes.append((event, str(args)))
+
+    sys.addaudithook(audit)
     root = ttk.Window(themename='cosmo')
     failures = []
     deadline = time.monotonic() + 30
@@ -46,13 +65,25 @@ def run_smoke(directory):
             assert len(app._batch_rows) == count + 1
             output = directory / 'results.csv'
             app._batch_export_csv(str(output))
+            root.after(50, finish_export)
+
+        def finish_export():
+            if 'export' in app._busy:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('导出超时')
+                root.after(50, finish_export)
+                return
+            output = directory / 'results.csv'
             with output.open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.DictReader(stream))
             assert rows and 'PSXT (dB)' in rows[0]
             assert np.isfinite(float(rows[0]['PSXT (dB)']))
             assert any('ICN' in key and value and np.isfinite(float(value))
                        for key, value in rows[0].items())
-            print('PASS GUI 导入、PowerSum / ICN 计算、CSV 导出读回')
+            with patch.object(ttk.Messagebox, 'show_info'):
+                app.save_config()
+            assert Path(str(sample) + '.json').is_file()
+            print('PASS GUI 导入、PowerSum / ICN 计算、配置保存、CSV 导出读回')
             root.quit()
 
         def toggle():
@@ -102,7 +133,7 @@ def run_smoke(directory):
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'计算超时: {app.status_var.get()}')
             if (app.plot_data and app._last_icn_results
-                    and not app._recalc_job and not app._redraw_job):
+                    and not app._recalc_job and not app._redraw_job and not app._busy):
                 callback()
             else:
                 root.after(50, lambda: wait_result(callback))
@@ -110,7 +141,15 @@ def run_smoke(directory):
         def start():
             assert root.winfo_exists()
             app.import_s_params(str(sample))
-            assert app.file_loaded and len(app.port_vars) == 8
+            root.after(50, loaded)
+
+        def loaded():
+            if not app.file_loaded:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(app.status_var.get())
+                root.after(50, loaded)
+                return
+            assert len(app.port_vars) == 8
             app.mode_var.set(app.DIFF_MODE)
             app.arrange_var.set('Type1')
             app.auto_select_var.set(True)
@@ -127,6 +166,8 @@ def run_smoke(directory):
             root.mainloop()
         finally:
             app._on_main_window_close()
+    auditing = False
+    assert not writes, writes
     if failures:
         raise RuntimeError('\n'.join(failures))
 

@@ -38,6 +38,11 @@ import contextlib
 import csv
 import json
 import sys
+import os
+import queue
+import threading
+from concurrent.futures import CancelledError
+from compute_runtime import Execution, LatestWorker, thread_count
 import tkinter as tk
 import tkinter.font as tkfont
 import types
@@ -53,7 +58,7 @@ from sparam_core import (SParameter, diff_pair, evaluate_expr,
 
 
 APP_NAME = 'S参数串扰计算'
-APP_VERSION = '0.4.1'
+APP_VERSION = '0.5.0'
 def _version_author_text():
     text = f'v{APP_VERSION}'
     if not getattr(sys, 'frozen', False):
@@ -94,6 +99,8 @@ class SParamPowerSumApp:
     # 配置字段映射: (JSON 键, 变量属性名)。公式只在 formulas.py 中维护,
     # 不写入配置, 也不从旧配置恢复, 确保源码修改直接决定计算结果。
     _SCALAR_FIELDS = (
+        ('cpu_threads', 'cpu_threads_var'), ('compute_backend', 'compute_backend_var'),
+        ('gpu_device', 'gpu_device_var'),
         ('mode_val', 'mode_var'), ('Z0', 'z0_var'), ('fmin', 'fmin_var'),
         ('fmax', 'fmax_var'), ('fstep', 'fstep_var'),
         ('name_align', 'name_align_var'),
@@ -144,6 +151,16 @@ class SParamPowerSumApp:
         self.root = root
         self.root.title(f'{APP_NAME} v{APP_VERSION}')
 
+        self._worker = LatestWorker()
+        self._generation = {'load': 0, 'compute': 0, 'plot': 0}
+        self._busy = set()
+        self._cancel_compute = threading.Event()
+        self._cancel_load = threading.Event()
+        self._closing = False
+        self.cpu_threads_var = ttk.StringVar(value='自动')
+        self.compute_backend_var = ttk.StringVar(value='自动')
+        self.gpu_device_var = ttk.StringVar(value='自动')
+        self.execution_status_var = ttk.StringVar(value='CPU / GPU 待检测')
         self._setup_scaling()
 
         self.file_loaded = False
@@ -217,11 +234,55 @@ class SParamPowerSumApp:
 
         self._build_ui()
         self._load_last_config()
+        self._poll_job = self.root.after(40, self._poll_worker)
+        self._submit('devices', self._detect_devices, self._devices_ready)
 
         # 主窗口关闭时连带关闭「批量导出」窗口
         self.root.protocol('WM_DELETE_WINDOW', self._on_main_window_close)
         # 窗口映射后按内容自适应左右栏默认宽度
         self.root.after(150, self._layout_initial_sashes)
+
+    def _new_load_check(self):
+        self._cancel_load.set()
+        self._cancel_load = threading.Event()
+        event = self._cancel_load
+        def check():
+            if event.is_set():
+                raise CancelledError()
+        return check
+
+    def _submit(self, channel, work, done):
+        token = self._generation.get(channel, 0) + 1
+        self._generation[channel] = token
+        self._busy.add(channel)
+        self._worker.submit(channel, token, work, done)
+
+    def _poll_worker(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                channel, token, done, value, error = self._worker.results.get_nowait()
+                if token != self._generation.get(channel):
+                    continue
+                self._busy.discard(channel)
+                try:
+                    done(value, error)
+                except Exception as exc:
+                    self._set_status(f'状态: 结果更新失败：{exc}', 'error')
+        except queue.Empty:
+            pass
+        self._poll_job = self.root.after(40, self._poll_worker)
+
+    @staticmethod
+    def _detect_devices():
+        from gpu_runtime import devices
+        return [key for key, device in devices() if device.double_fp_config]
+
+    def _devices_ready(self, values, error):
+        self._gpu_combo.configure(values=['自动'] + (values or []))
+        self.execution_status_var.set(
+            f'发现 {len(values)} 个双精度 GPU' if values else f'CPU 可用；GPU 不可用：{error or "无双精度设备"}')
 
     # -------------------- 窗口与样式 --------------------
 
@@ -455,6 +516,21 @@ class SParamPowerSumApp:
                 row=0, column=col, sticky='ew',
                 padx=(0 if col == 0 else self._GAP_SM, 0))
             var.trace_add('write', lambda *_: self._schedule_recalculate())
+
+        for row, label, var, values in (
+                (5, 'CPU 线程数:', self.cpu_threads_var,
+                 ['自动'] + [str(i) for i in range(1, (os.cpu_count() or 1) + 1)]),
+                (7, '计算后端:', self.compute_backend_var, ['自动', 'CPU', 'GPU']),
+                (9, 'GPU 设备:', self.gpu_device_var, ['自动'])):
+            ttk.Label(param_group, text=label).grid(row=row, column=0, sticky='w')
+            combo = ttk.Combobox(param_group, textvariable=var, values=values,
+                                 state='readonly', width=20)
+            combo.grid(row=row + 1, column=0, sticky='ew')
+            var.trace_add('write', lambda *_: self._schedule_recalculate())
+            if row == 9:
+                self._gpu_combo = combo
+        ttk.Label(param_group, textvariable=self.execution_status_var,
+                  wraplength=240).grid(row=11, column=0, sticky='ew')
 
         # ---- ICN计算: 启用开关 + 变量输入。公式只在 formulas.py 中维护,
         #      不在界面展示或编辑, 也不随配置保存。 ----
@@ -1274,6 +1350,9 @@ class SParamPowerSumApp:
 
     def _on_main_window_close(self):
         """主窗口关闭时连带关闭「批量导出」窗口。"""
+        if 'export' in self._busy:
+            self._set_status('状态: 正在导出，请完成后关闭窗口。', 'warn')
+            return
         if self.batch_window is not None:
             try:
                 self.batch_window.destroy()
@@ -1281,6 +1360,11 @@ class SParamPowerSumApp:
                 pass
             self.batch_window = None
             self._batch_tree = None
+        self._closing = True
+        self._cancel_compute.set()
+        self._cancel_load.set()
+        self._worker.close()
+        self.root.after_cancel(self._poll_job)
         self.root.destroy()
 
     # -------------------- 「批量导出」窗口 --------------------
@@ -1476,7 +1560,8 @@ class SParamPowerSumApp:
         条件不满足 (未导入/未计算/未勾 Victim) 时返回 None。"""
         if not self.file_loaded or not self.plot_data:
             return None
-        if self._recalc_job is not None or self._redraw_job is not None:
+        if (self._recalc_job is not None or self._redraw_job is not None
+                or self._busy.intersection({'load', 'compute', 'plot'})):
             return None
         v_ports = self._result_ports
         if not v_ports:
@@ -1601,20 +1686,22 @@ class SParamPowerSumApp:
                  if any(name in row['_vals'] for row in self._batch_rows)]
         cols = ['Port', '端口名'] + [
             f'{name} ({"dB" if name.startswith("PS") else "V"})' for name in names]
-        try:
+        rows = [(row['Port'], row['端口名'], dict(row['_vals'])) for row in self._batch_rows]
+        if 'export' in self._busy:
+            self._set_status('状态: 请等待当前导出完成。', 'warn')
+            return
+
+        def export():
             with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
                 writer.writerow(cols)
-                for row in self._batch_rows:
-                    writer.writerow(
-                        [row['Port'], row['端口名']] +
-                        [format(float(row['_vals'][name]), '.17g')
-                         if row['_vals'].get(name) is not None else ''
-                         for name in names])
-        except OSError as e:
-            ttk.Messagebox.show_error('错误', f'导出 CSV 失败：\n{e}')
-            return
-        self._set_status(f'状态: 批量导出完成 → {filepath}', 'success')
+                for port, label, values in rows:
+                    writer.writerow([port, label] + [format(float(values[name]), '.17g')
+                        if values.get(name) is not None else '' for name in names])
+
+        self._submit('export', export, lambda value, error: self._set_status(
+            f'状态: 导出 CSV 失败：{error}' if error else f'状态: 批量导出完成 → {filepath}',
+            'error' if error else 'success'))
 
     def _batch_clear(self):
         """完全清空列表缓存, 可重新逐条添加。"""
@@ -1654,6 +1741,9 @@ class SParamPowerSumApp:
         self.auto_calculate()
 
     def _schedule_redraw(self):
+        self._generation['plot'] += 1
+        self._worker.discard('plot')
+        self._busy.discard('plot')
         if self._redraw_job is not None:
             self.root.after_cancel(self._redraw_job)
         self._redraw_job = self.root.after(self._REDRAW_DELAY_MS,
@@ -1665,16 +1755,18 @@ class SParamPowerSumApp:
 
     # -------------------- 端口表操作 --------------------
 
-    def _build_port_table(self, num_ports, port_names):
+    def _build_port_table(self, num_ports, port_names, start=0, ready=None):
         """重建端口勾选表数据行: 每行 Port + 端口名 + 3 个真实勾选框
         (表头冻结在滚动区外, 见 _build_port_header, 此处不重建)。"""
         container = self.port_list
-        for w in container.winfo_children():
-            w.destroy()
-        self.port_vars = []
-        self._port_rows = []
+        if start == 0:
+            for w in container.winfo_children():
+                w.destroy()
+            self.port_vars = []
+            self._port_rows = []
 
-        for i in range(num_ports):
+        stop = min(start + 32, num_ports) if ready else num_ports
+        for i in range(start, stop):
             port_str = f'Port {i + 1}'
             name_str = port_names[i] if i < len(port_names) else '-'
 
@@ -1701,9 +1793,18 @@ class SParamPowerSumApp:
             n_cb.grid(row=i, column=4, padx=self._GAP_XS)
             self._port_rows.append(((v_cb, f_cb, n_cb), port_label, name_label))
 
+        if stop < num_ports:
+            token = self._generation['load']
+            self.root.after(1, lambda: self._build_port_table(
+                num_ports, port_names, stop, ready)
+                if not self._closing and token == self._generation['load'] else None)
+            return
         self.sync_table_ui()
         self._sync_port_columns()
         self._adapt_right_pane()
+        if ready:
+            self._busy.discard('load')
+            ready()
 
     _NAME_ANCHORS = {'左': 'w', '居中': 'center', '右': 'e'}
 
@@ -1921,19 +2022,27 @@ class SParamPowerSumApp:
         v_ports, f_ports, n_ports = self._get_selected_ports()
         self._invalidate_results()
         self.file_loaded = False
-        try:
-            self.spara_obj = SParameter(
-                self.filepath,
-                port_format=self._selected_port_format_key())
-        except Exception as e:
-            self._set_status('状态: 按所选端口格式重新解析失败！', 'error')
-            ttk.Messagebox.show_error('错误', f'重新解析文件失败：\n{e}')
+        path, fmt = self.filepath, self._selected_port_format_key()
+        check = self._new_load_check()
+        self._submit('load', lambda: SParameter(path, port_format=fmt, check_cancel=check),
+                     lambda obj, error: self._finish_reparse(
+                         obj, error, (v_ports, f_ports, n_ports)))
+
+    def _finish_reparse(self, obj, error, ports, table_ready=False):
+        if error:
+            self._set_status(f'状态: 重新解析失败：{error}', 'error')
             return
+        self.spara_obj = obj
+        if not table_ready:
+            self._busy.add('load')
+            self._build_port_table(obj.num_ports, obj.port_names,
+                ready=lambda: self._finish_reparse(obj, None, ports, True))
+            return
+        v_ports, f_ports, n_ports = ports
         self.file_loaded = True
         self._sparam_cache = None      # 重采样缓存随解析结果作废
         num_ports = self.spara_obj.num_ports
         with self._paused():
-            self._build_port_table(num_ports, self.spara_obj.port_names)
             for p in v_ports:
                 if p <= num_ports:
                     self.port_vars[p - 1][0].set(True)
@@ -1970,18 +2079,32 @@ class SParamPowerSumApp:
         # 避免长文件名撑宽左栏
         self.root.title(f'{APP_NAME} v{APP_VERSION} - {filename}')
         self._set_status('状态: 正在读取矩阵与频率...', 'info')
-        self.root.update_idletasks()
+        fmt = self._selected_port_format_key()
+        check = self._new_load_check()
 
+        def load():
+            saved = self._load_file_config(filepath + '.json')
+            selected = saved.get('port_format') if isinstance(saved, dict) else None
+            selected_key = next((rule['key'] for rule in port_format.FORMAT_RULES
+                                 if rule['name'] == selected), fmt)
+            if selected == self._FMT_AUTO:
+                selected_key = None
+            return SParameter(filepath, port_format=selected_key, check_cancel=check), saved
+
+        self._submit('load', load, lambda value, error: self._finish_import(
+            value, error, filename))
+
+    def _finish_import(self, value, error, filename, table_ready=False):
         try:
-            # 端口格式影响解析: 先读同名配置恢复手动纠正记录, 再解析
-            saved = self._load_file_config(self._get_file_config_path())
-            if saved:
-                fmt_saved = saved.get('port_format')
-                if fmt_saved in self._FMT_OPTIONS:
-                    self.port_format_var.set(fmt_saved)
-            self.spara_obj = SParameter(
-                filepath, port_format=self._selected_port_format_key())
+            if error:
+                raise error
+            self.spara_obj, saved = value
             num_ports = self.spara_obj.num_ports
+            if not table_ready:
+                self._busy.add('load')
+                self._build_port_table(num_ports, self.spara_obj.port_names,
+                    ready=lambda: self._finish_import(value, None, filename, True))
+                return
             freqs = self.spara_obj.frequencies
 
             self.file_z0_var.set(f'文件原始阻抗: {self.spara_obj.z0:g} Ω')
@@ -1999,8 +2122,6 @@ class SParamPowerSumApp:
                     self.fmax_var.set(repr(float(freqs[-1])))
                     self.fstep_var.set(
                         repr(float((freqs[-1] - freqs[0]) / (len(freqs) - 1))))
-
-            self._build_port_table(num_ports, self.spara_obj.port_names)
 
             for var in (self.chk_all_v_var, self.chk_all_f_var, self.chk_all_n_var):
                 var.set(False)
@@ -2031,6 +2152,11 @@ class SParamPowerSumApp:
     # -------------------- 自动计算 --------------------
 
     def _invalidate_results(self):
+        self._cancel_compute.set()
+        for channel in ('compute', 'plot'):
+            self._generation[channel] += 1
+            self._worker.discard(channel)
+            self._busy.discard(channel)
         self.plot_data = None
         self._last_icn_results = None
         self._last_mark_peaks = {}
@@ -2114,22 +2240,64 @@ class SParamPowerSumApp:
         # 重采样缓存: 基本参数 (z0/fmin/fmax/fstep) 任一变化即整体重建;
         # 端口勾选/公式/绘图开关变化时直接复用缓存, 避免重复插值。
         # 缓存的是"归一化 + 插值后"的数据副本, 原始 spara_obj 不被修改。
+        self._cancel_compute = threading.Event()
         try:
-            key = (z0, fmin, fmax, fstep)
-            cache = self._sparam_cache
-            if cache is None or cache[0] != key:
-                params, freqs = resample_sparams(
-                    self.spara_obj, z0, fmin, fmax, fstep)
-                cache = (key, types.SimpleNamespace(
-                    parameters=params, frequencies=freqs,
-                    z0=z0, num_ports=params.shape[0]))
-                self._sparam_cache = cache
-            self.plot_data = power_sum_db(
-                cache[1], z0, v_ports, f_ports, n_ports, is_diff, fmin, fmax)
-        except (ValueError, np.linalg.LinAlgError, ZeroDivisionError) as e:
-            self._set_status(f'状态: 计算失败！{e}', 'error')
+            execution = Execution(self.cpu_threads_var.get(), self.compute_backend_var.get(),
+                                  self.gpu_device_var.get(), self._cancel_compute)
+        except ValueError as exc:
+            self._set_status(f'状态: {exc}', 'error')
             return
+        source = self.spara_obj
+        previous = self._sparam_cache
+        enabled = self.icn_enabled_var.get()
+        scalars, scalar_error = self._eval_icn_scalars() if enabled else ({}, None)
+        key = (id(source), z0, fmin, fmax, fstep, execution.backend, execution.device)
 
+        def calculate():
+            execution.select(source.parameters.size)
+
+            def run(cache):
+                execution.check()
+                with execution.limits():
+                    if cache is None or cache[0] != key:
+                        params, freqs = resample_sparams(source, z0, fmin, fmax, fstep,
+                                                        execution=execution)
+                        cache = (key, types.SimpleNamespace(parameters=params, frequencies=freqs,
+                                                           z0=z0, num_ports=params.shape[0]))
+                    data = power_sum_db(cache[1], z0, v_ports, f_ports, n_ports,
+                                        is_diff, fmin, fmax, execution=execution)
+                    data['fstep_hz'] = fstep * 1e9
+                    icn, warning = None, scalar_error
+                    if enabled and not warning:
+                        try:
+                            icn = icn_calculate(data['fn_hz'], data['fext_power_lin'],
+                                                data['next_power_lin'],
+                                                dict(scalars, fstep=fstep * 1e9), execution=execution)
+                        except ValueError as exc:
+                            warning = str(exc)
+                    execution.check()
+                    return data, cache, icn, warning, execution.note
+            try:
+                return run(previous)
+            except CancelledError:
+                raise
+            except Exception as exc:
+                if execution.gpu is None or isinstance(exc, (ValueError, np.linalg.LinAlgError)):
+                    raise
+                execution.gpu = None
+                execution.note = f'CPU {execution.threads} 线程；GPU 失败，CPU 回退：{exc}'
+                return run(None)
+
+        self._submit('compute', calculate, lambda value, error: self._finish_calculate(
+            value, error, v_ports, f_ports, n_ports, is_diff, fstep))
+
+    def _finish_calculate(self, value, error, v_ports, f_ports, n_ports, is_diff, fstep):
+        if error:
+            if not isinstance(error, CancelledError):
+                self._set_status(f'状态: 计算失败！{error}', 'error')
+            return
+        self.plot_data, self._sparam_cache, self._last_icn_results, warning, note = value
+        self.execution_status_var.set(note)
         # 差分模式回显实际参与计算的端口对子, 便于核对配对是否符合预期
         if is_diff:
             def pair_text(ports):
@@ -2144,9 +2312,8 @@ class SParamPowerSumApp:
             self._set_status('状态: 计算完成！参数修改可实时重算重绘。', 'success')
         self.plot_data['fstep_hz'] = fstep * 1e9
         self._result_ports = tuple(v_ports)
-        self._update_icn_results()
-        icn_error = (self.status_var.get() if self.icn_enabled_var.get()
-                     and self._last_icn_results is None else None)
+        icn_error = f'状态: ICN/ccICN 计算失败 ({warning})' if warning else None
+        self._icn_warning = icn_error
         self.draw_curves()
         if icn_error:
             self._set_status(icn_error, 'warn')
@@ -2230,6 +2397,30 @@ class SParamPowerSumApp:
             return
 
         data = self.plot_data
+        mark = self.mark_freq_var.get().strip()
+        visible = (self.chk_fext_var.get(), self.chk_next_var.get(), self.chk_psxt_var.get())
+
+        def prepare():
+            peaks = {}
+            if mark:
+                target = float(mark)
+                if not np.isfinite(target):
+                    raise ValueError('Mark Freq 必须是有限数')
+                stop = int(np.searchsorted(data['fn_ghz'], target, side='right'))
+                for enabled, name, key, flag in zip(visible,
+                        ('PSFEXT', 'PSNEXT', 'PSXT'), ('MDFEXT', 'MDNEXT', 'PSXT'),
+                        (data['has_fext'], data['has_next'], True)):
+                    if enabled and flag and stop:
+                        index = int(np.argmax(data[key][:stop]))
+                        peaks[name] = (data['fn_ghz'][index], data[key][index])
+            return peaks
+
+        self._submit('plot', prepare, lambda value, error: self._finish_draw(data, value, error))
+
+    def _finish_draw(self, data, peaks, error):
+        self._last_mark_peaks = peaks or {}
+        if error:
+            self._set_status(f'状态: Mark Freq 无效，已忽略：{error}', 'warn')
         self.ax.clear()
         self.ax.grid(True, alpha=0.4)
 
@@ -2255,26 +2446,13 @@ class SParamPowerSumApp:
         self.canvas_mpl.draw()
         self._refresh_data_table()
         # 「批量导出」窗口打开且自动添加开关启用时缓存数据
+        status = self.status_var.get()
         self._batch_auto_add()
+        if getattr(self, '_icn_warning', None):
+            self._set_status(status, 'warn')
 
     def _annotate_mark_peak(self, data):
         """在 Mark Freq 上限之前为各条可见曲线标注峰值。"""
-        mark_str = self.mark_freq_var.get().strip()
-        if not mark_str:
-            return
-        try:
-            mark_target = float(mark_str)
-        except ValueError:
-            self._set_status('状态: Mark Freq 输入无效，已忽略。', 'warn')
-            return
-
-        if not np.isfinite(mark_target):
-            self._set_status('状态: Mark Freq 必须是有限数。', 'warn')
-            return
-        m_idx = int(np.searchsorted(data['fn_ghz'], mark_target, side='right'))
-        if m_idx == 0:
-            return
-
         series = (
             ('PSFEXT', 'MDFEXT', 'has_fext', self.chk_fext_var, '#D95319'),
             ('PSNEXT', 'MDNEXT', 'has_next', self.chk_next_var, '#0072BD'),
@@ -2286,11 +2464,9 @@ class SParamPowerSumApp:
                 continue
             if flag is not None and not data[flag]:
                 continue
-            seg = data[key][:m_idx]
-            idx = int(np.argmax(seg))
-            self._last_mark_peaks[name] = (data['fn_ghz'][idx], seg[idx])
-            if np.isfinite(seg[idx]):
-                points.append((data['fn_ghz'][idx], seg[idx], color))
+            peak = self._last_mark_peaks.get(name)
+            if peak is not None and np.isfinite(peak[1]):
+                points.append((*peak, color))
         if not points:
             return
 

@@ -3,6 +3,7 @@ import io
 import sys
 import tempfile
 import unittest
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -87,7 +88,20 @@ class AccuracyTests(unittest.TestCase):
             with patch.object(app_mod.SParamPowerSumApp, '_load_last_config'), \
                  patch.object(app_mod.SParamPowerSumApp, '_load_file_config', return_value=None):
                 app = app_mod.SParamPowerSumApp(root)
+                def wait():
+                    deadline = time.monotonic() + 30
+                    while app._busy or app._recalc_job or app._redraw_job:
+                        root.update()
+                        if time.monotonic() > deadline:
+                            self.fail(f'异步任务超时：{app._busy} {app.status_var.get()}')
+                        time.sleep(.01)
+                original_calculate = app.auto_calculate
+                def calculate():
+                    original_calculate()
+                    wait()
+                app.auto_calculate = calculate
                 app.import_s_params(str(ROOT / 'sample_data/demo.s8p'))
+                wait()
             self.assertTrue(app.file_loaded)
             def select(v=(1, 2), f=(3, 4), n=()):
                 with app._paused():
@@ -115,6 +129,7 @@ class AccuracyTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(dir=ROOT / 'tests') as tmp:
                 path = Path(tmp) / 'export.csv'
                 app._batch_export_csv(str(path))
+                wait()
                 with path.open(encoding='utf-8-sig', newline='') as f:
                     row = next(csv.DictReader(f))
                 self.assertEqual(float(row['ICN (V)']), 1.234567890123456e-6)

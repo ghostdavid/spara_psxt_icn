@@ -7,6 +7,8 @@ numpy==2.5.2        # 数值计算
 scipy==1.18.1       # PCHIP 插值
 matplotlib==3.11.1  # TkAgg 曲线绘制
 ttkbootstrap==2.2.2 # Tk 界面主题组件
+threadpoolctl==3.8.0 # CPU 数值线程预算
+pyopencl==2026.1.5 # 可选跨品牌 GPU；缺少驱动时回退 CPU
 
 # 仅打包 exe 时另行安装:
 # python -m pip install pyinstaller==6.22.2

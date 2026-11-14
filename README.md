@@ -1,4 +1,4 @@
-# S参数串扰计算工具 v0.4.1
+# S参数串扰计算工具 v0.5.0
 
 面向信号完整性（SI）分析的桌面工具。导入 Touchstone（`.sNp`）S 参数文件，选择受害端口（Victim）与攻击端口，计算 **PSFEXT（远端串扰）、PSNEXT（近端串扰）、PSXT（总串扰）**，并绘制频率曲线。支持单端、差分模式以及 **ICN / ccICN 集成串扰噪声**计算，适合比较 DDR/LPDDR 等并行总线不同布线方案的串扰结果。
 
@@ -51,14 +51,14 @@ py -3.14 -m venv .venv
 ### 启动程序
 
 ```powershell
-.\.venv\Scripts\python.exe main.py
+.\.venv\Scripts\python.exe -B main.py
 ```
 
 也可在启动时导入示例或自己的文件：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py sample_data/demo.s8p
-.\.venv\Scripts\python.exe main.py "C:\data\channel.s16p"
+.\.venv\Scripts\python.exe -B main.py sample_data/demo.s8p
+.\.venv\Scripts\python.exe -B main.py "C:\data\channel.s16p"
 ```
 
 ## 第一次使用
@@ -71,6 +71,18 @@ py -3.14 -m venv .venv
 6. 打开「批量导出」，点击「添加数据」缓存当前结果。切换端口后可继续添加，最后导出 CSV 或复制整张表格。
 
 操作时留意底部状态栏：这里会显示计算错误、实际采用的端口对子、计算频带及频带延拓警告。
+
+## 多线程与 GPU
+
+“基本设置”提供以下选项，随文件配置或默认配置保存：
+
+- **CPU 线程数**：默认“自动”（可用逻辑处理器数减一，至少一个），也可指定线程数。它控制数值工作预算，不是整个程序或显卡驱动的线程总数。线程越多不一定越快。
+- **计算后端**：自动 / CPU / GPU。自动模式对较小的源矩阵使用 CPU；GPU 模式尝试使用所选设备。设置下方显示实际计算路径及回退原因。
+- **GPU 设备**：自动选择或指定支持双精度的 OpenCL GPU。后端面向 Intel、AMD、NVIDIA，但需要设备驱动提供 OpenCL 和双精度能力；目前真实硬件验证为 Intel，AMD/NVIDIA 尚未实测。
+
+文件加载、重新解析、数值计算、峰值准备和 CSV 导出在后台进行；改变输入会丢弃旧任务结果。CPU 对插值通道并行处理并控制数值库内部线程。GPU 用于双精度 PCHIP、耦合运算、PowerSum 与 ICN 公式数组运算；阻抗归一化等仍使用 CPU，因此界面显示“混合计算”。
+
+缺少 GPU 库、驱动、双精度能力或设备运行失败时使用 CPU 并提示原因，不降低计算精度。首次 GPU 编译及数据传输有开销，不保证比 CPU 快。Matplotlib 最终布局和画布绘制仍在主线程使用 CPU，并非 GPU 绘图。导出进行中请等待完成后关闭程序。
 
 ## 结果与配置
 
@@ -128,8 +140,16 @@ Victim、FEXT、NEXT 角色不能重叠。单端模式需要一个 Victim；差�
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pyinstaller==6.22.2
-.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm main.spec
+.\build.bat
 ```
+
+构建入口在构建前后检查整个项目（含 `.venv`、`build`、`dist` 和隐藏目录）的 `Zone.Identifier`，发现任何来源标记即失败，不会自动信任下载文件。单独检查可运行 `powershell -NoProfile -File check_zones.ps1`。浏览器下载或解压可能添加来源标记，需要核实来源后人工处理，不能通过关闭 Windows 安全策略规避。
+
+### 运行时文件写入约束
+
+除用户主动保存配置和导出 CSV 外，应用不主动写文件。Matplotlib 资源与字体随目录版分发，字体索引和计算缓存只保存在内存，不创建 AppData 缓存、探测文件、锁文件或临时目录。请使用 `requirements.txt` 中指定的依赖版本。源码启动使用 `python -B main.py`，避免导入字节码写盘。历史版本的 AppData 缓存不会被新版本读取或自动删除。
+
+此约束不包括自行构建产生的文件和 Windows 自身的安全扫描、预读、分页等系统行为。
 
 ### 可选：仅在打包版显示作者署名
 
@@ -156,37 +176,6 @@ dist/
 
 双击该 exe 启动。向其他 Windows 用户分发时，请压缩并提供**整个 `S参数串扰计算_dir` 文件夹**，不能只复制 exe。项目使用目录版构建，不提供单文件构建配置；`build/` 为构建中间文件，`dist/` 为本地输出，两者均被 Git 忽略。
 
-## 开发与反馈
-
-| 文件 / 目录 | 用途 |
-| --- | --- |
-| `main.py` | 程序入口，支持启动参数导入 |
-| `app.py` | 界面、计算调度、曲线、表格、导出与配置 |
-| `sparam_core.py` | 文件解析、归一化、重采样及计算 |
-| `formulas.py` | PowerSum / ICN / ccICN 数学公式 |
-| `port_format.py` | 端口注释识别和端口名提取 |
-| `main.spec` | PyInstaller 目录版构建配置 |
-| `sample_data/` | 合成演示数据 |
-| `docs/images/` | README 使用的界面截图 |
-| `tests/` | GUI 冒烟、配置隔离及核心回归脚本 |
-
-需要验证代码修改时，可按改动范围选择执行以下脚本。GUI 冒烟需要可用的桌面会话，使用临时目录中的示例副本：
-
-```powershell
-.\.venv\Scripts\python.exe -B tests/_smoke_gui.py
-```
-
-测试仅运行源码回归和 GUI 冒烟，不再要求执行打包后的程序测试。
-
-修改计算或文件解析逻辑时，可运行核心回归：
-
-```powershell
-.\.venv\Scripts\python.exe -B tests/test_sparam.py
-.\.venv\Scripts\python.exe -B tests/test_icn.py
-.\.venv\Scripts\python.exe -B tests/test_port_format.py
-.\.venv\Scripts\python.exe -B tests/test_accuracy_fixes.py
-```
-
-这些脚本通过各自入口运行，不使用统一 pytest 自动发现。
+## 问题与反馈
 
 遇到问题或有功能建议，请在 [GitHub Issues](https://github.com/ghostdavid/spara_xtalk_icn/issues) 中提供软件版本、Python/Windows 版本、复现步骤及错误信息。涉及 S 参数文件时，优先提供可公开的最小示例，避免上传保密设计数据。

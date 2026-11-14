@@ -9,6 +9,9 @@
 """
 
 import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 import ttkbootstrap as ttk
 
@@ -18,7 +21,14 @@ from app import APP_NAME, APP_VERSION, SParamPowerSumApp
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
 
-    root = ttk.Window(title=f'{APP_NAME} v{APP_VERSION}', themename='cosmo')
+    extension = 'ico' if sys.platform == 'win32' else 'png'
+    icon_path = Path(__file__).resolve().parent / 'assets' / f'app_icon.{extension}'
+    root = ttk.Window(title=f'{APP_NAME} v{APP_VERSION}', themename='cosmo',
+                      iconphoto=str(icon_path))
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'SParamTools.CrosstalkNoise')
     app = SParamPowerSumApp(root)
 
     if argv:

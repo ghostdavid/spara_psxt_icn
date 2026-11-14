@@ -37,7 +37,8 @@ class SParameter:
 
     _FREQ_FACTORS = {'hz': 1.0, 'khz': 1e3, 'mhz': 1e6, 'ghz': 1e9}
 
-    def __init__(self, filepath, port_format=None):
+    def __init__(self, filepath, port_format=None, check_cancel=None):
+        self._check_cancel = check_cancel or (lambda: None)
         self.filepath = filepath
         self.num_ports = 0
         self.frequencies = np.zeros(0)          # Hz, 升序去重
@@ -120,6 +121,8 @@ class SParameter:
         option_seen = False
 
         for line_number, line in enumerate(lines, 1):
+            if line_number % 1024 == 1:
+                self._check_cancel()
             line = line.strip()
             if line.startswith('!'):
                 if 'TouchstoneFormatFlag' in line:
@@ -376,7 +379,7 @@ def frequency_grid(fmin, fmax, fstep):
     return grid
 
 
-def resample_sparams(spara, z0, fmin_ghz, fmax_ghz, fstep_ghz):
+def resample_sparams(spara, z0, fmin_ghz, fmax_ghz, fstep_ghz, execution=None):
     """阻抗归一化 + 频点重采样一次性预处理, 返回 (params, freqs_hz)。
 
     按 fmin/fmax/fstep 把 S 参数重组到等间隔网格; 对每个 S[i,j]
@@ -392,12 +395,24 @@ def resample_sparams(spara, z0, fmin_ghz, fmax_ghz, fstep_ghz):
     spara_param = spara.parameters
     if abs(spara.z0 - z0) > 1e-10:
         all_ports = list(range(1, spara_param.shape[0] + 1))
-        spara_param = snp2smp(spara_param, spara.z0, all_ports, z0)
+        if execution is None:
+            spara_param = snp2smp(spara_param, spara.z0, all_ports, z0)
+        else:
+            normalized = np.empty_like(spara_param)
+            width = max(1, 16 * 1024 * 1024 // (spara.num_ports ** 2 * 16 * 4))
+            for start in range(0, spara_param.shape[2], width):
+                execution.check()
+                stop = start + width
+                normalized[:, :, start:stop] = snp2smp(
+                    spara_param[:, :, start:stop], spara.z0, all_ports, z0)
+            spara_param = normalized
     if not np.all(np.isfinite(spara_param)):
         raise ValueError('S 参数包含非有限值')
 
     x = spara.frequencies
     n_ports = spara_param.shape[0]
+    if execution is not None:
+        return execution.interpolate(x, spara_param, fn), fn
     out = np.zeros((n_ports, n_ports, num_points), dtype=complex)
     for i in range(n_ports):
         for j in range(n_ports):
@@ -417,7 +432,7 @@ def resample_sparams(spara, z0, fmin_ghz, fmax_ghz, fstep_ghz):
 # ==================== PowerSum 功率和计算 ====================
 
 def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
-                 fmin_ghz, fmax_ghz, formulas=None):
+                 fmin_ghz, fmax_ghz, formulas=None, execution=None):
     """计算 PSFEXT / PSNEXT / PSXT 功率和曲线。
 
     spara: SParameter 实例; 端口号均为 1 起始。
@@ -440,6 +455,7 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
     全程不修改 spara.parameters (归一化/抽取均产生新数组)。
     """
     formulas = dict(DEFAULT_FORMULAS, **(formulas or {}))
+    evaluate = execution.evaluate if execution is not None else evaluate_expr
     spara_freq = spara.frequencies
     spara_param = spara.parameters
 
@@ -478,6 +494,22 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
 
     def stack_paths(attack_ports):
         """耦合路径 dB 曲线堆叠成 (路径数, 频点数) 二维矩阵。"""
+        if execution is not None and execution.gpu is not None and attack_ports:
+            if is_diff:
+                p = np.asarray(attack_ports).reshape(-1, 2) - 1
+                v = np.asarray(v_ports) - 1
+                a = spara_param[v[0], p[:, 0]][:, mask]
+                b = spara_param[v[0], p[:, 1]][:, mask]
+                c = spara_param[v[1], p[:, 0]][:, mask]
+                d = spara_param[v[1], p[:, 1]][:, mask]
+                values = execution.gpu.elementwise('(a-b)*0.5', [a.real-b.real, c.real-d.real])
+                imaginary = execution.gpu.elementwise('(a-b)*0.5', [a.imag-b.imag, c.imag-d.imag])
+            else:
+                raw = spara_param[v_ports[0]-1, np.asarray(attack_ports)-1][:, mask]
+                values, imaginary = raw.real, raw.imag
+            if not np.all(np.isfinite(values)) or not np.all(np.isfinite(imaginary)):
+                raise ValueError('S 参数包含非有限值')
+            return execution.gpu.elementwise('20.0*log10(hypot(a,b))', [values, imaginary])
         curves = coupled_db(attack_ports)
         if not curves:
             return np.zeros((0, len(fn)))
@@ -490,7 +522,7 @@ def power_sum_db(spara, z0, v_ports, f_ports, n_ports, is_diff,
     def eval_curve(name):
         try:
             with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-                arr = np.asarray(evaluate_expr(formulas[name], env),
+                arr = np.asarray(evaluate(formulas[name], env),
                                  dtype=float)
         except ValueError as e:
             raise ValueError(f'公式 {name}: {e}') from e
@@ -626,7 +658,7 @@ def _as_scalar(value, name):
 
 
 def icn_calculate(fn_hz, fext_power_lin, next_power_lin,
-                  scalars, formulas=None):
+                  scalars, formulas=None, execution=None):
     """按公式计算 ICN / ccICN (结果单位 V)。
 
     参数:
@@ -644,6 +676,7 @@ def icn_calculate(fn_hz, fext_power_lin, next_power_lin,
     返回 dict (单位 V): icn_n / icn_f / icn / ccicn_n / ccicn_f / ccicn。
     """
     formulas = dict(DEFAULT_FORMULAS, **(formulas or {}))
+    evaluate = execution.evaluate if execution is not None else evaluate_expr
 
     fn = np.asarray(fn_hz, dtype=float)
     if fn.ndim != 1 or not fn.size or not np.all(np.isfinite(fn)):
@@ -660,7 +693,7 @@ def icn_calculate(fn_hz, fext_power_lin, next_power_lin,
     # 1) 标量中间量: deltaf (默认=fstep), fr, ft_n, ft_f, sf
     for name in ('deltaf', 'fr', 'ft_n', 'ft_f', 'sf'):
         try:
-            env[name] = _as_scalar(evaluate_expr(formulas[name], env), name)
+            env[name] = _as_scalar(evaluate(formulas[name], env), name)
         except ValueError as e:
             raise ValueError(f'公式 {name}: {e}') from e
     if env['deltaf'] <= 0:
@@ -669,7 +702,7 @@ def icn_calculate(fn_hz, fext_power_lin, next_power_lin,
     # 2) 矢量: Wnt, Wft, ChannelLoss_n, ChannelLoss_f
     for name in ('Wnt', 'Wft', 'ChannelLoss_n', 'ChannelLoss_f'):
         try:
-            arr = np.asarray(evaluate_expr(formulas[name], env), dtype=float)
+            arr = np.asarray(evaluate(formulas[name], env), dtype=float)
         except ValueError as e:
             raise ValueError(f'公式 {name}: {e}') from e
         if arr.shape != fn.shape:
@@ -683,7 +716,7 @@ def icn_calculate(fn_hz, fext_power_lin, next_power_lin,
     out = {}
     for name in ('ICN_n', 'ICN_f', 'ICN', 'ccICN_n', 'ccICN_f', 'ccICN'):
         try:
-            out[name.lower()] = _as_scalar(evaluate_expr(formulas[name], env),
+            out[name.lower()] = _as_scalar(evaluate(formulas[name], env),
                                            name)
         except ValueError as e:
             raise ValueError(f'公式 {name}: {e}') from e
